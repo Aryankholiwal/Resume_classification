@@ -1,0 +1,8 @@
+ibm-watson-machine-learning
+python-dotenv
+PyPDF2
+python-docx
+pytesseract
+PyMuPDF
+pdf2image
+openpyxl

@@ -1,0 +1,418 @@
+# config.py
+
+# === Folder Paths ===
+RESUME_INPUT_FOLDER = "resumes"
+TEMPLATE_PATH = "templates/final_template.docx"
+OUTPUT_FOLDER = "outputs"
+
+# === LLaMA Model Configuration ===
+LLAMA_MODEL_NAME = "llama3"
+
+# === Prompt Template ===
+PROMPT_TEMPLATE = """
+You are a strict resume parser. Parse the resume below and return only a valid JSON structure.
+
+===========================
+GENERAL RULES
+===========================
+- Output must be syntactically valid JSON — no markdown, commentary, or notes.
+- All keys and string values must be wrapped in double quotes.
+- Always return every top-level key, even if empty or \"Not Specified\".
+- Resume content may be in bullets, inline text, or tables — normalize accordingly.
+- DO NOT embed project descriptions inside Employment History (unless no Projects section exists).
+- Distinguish actual EMPLOYERS (who paid the salary) from CLIENTS (e.g., banks, partners).
+- Use fallback logic if a section is missing or unclear.
+
+===========================
+1. \"Recent Employer\"
+===========================
+- Extract the most recent employer (not a client).
+- Infer from Employment History sequence if needed.
+
+===========================
+2. \"Job Title\"
+===========================
+- Most recent valid job designation.
+- Example: \"Software Engineer\", \"Data Analyst\"
+
+===========================
+3. \"Professional Summary\"
+===========================
+- If present, extract it.
+- If absent, generate a concise 2–4 line summary including:
+  - Years of experience
+  - Technologies used
+  - Domain/industry
+  - Highlights of work
+
+===========================
+4. \"Employment History\"
+===========================
+\"Employment History\": {
+  \"Company A\": [
+    {
+      \"Role\": \"...\",
+      \"Duration\": \"...\",
+      \"Description\": \"...\"
+    }
+  ],
+  \"Company B\": [...]
+}
+
+DO:
+- Include all employers: full-time, internships, freelance
+- Include multiple roles per company
+- Accept inline/tabular formats like:
+  Company | Role | Duration | Description
+
+DO NOT:
+- Use clients or tools (e.g., Nordea Bank, AWS) as company names
+- Merge roles across different companies
+- Repeat the same Role–Duration–Description under different companies
+
+Fallback if section is empty:
+- Use Recent Employer, Job Title, and summary to fill one dummy role.
+
+===========================
+5. \"Skills\"
+===========================
+\"Skills\": {
+  \"Hard Skill\": [...],
+  \"Soft Skill\": [...]
+}
+
+- Hard Skills: technologies, frameworks, tools (e.g., Python, SQL)
+- Soft Skills: communication, teamwork, leadership
+
+===========================
+6. \"Certifications\"
+===========================
+[
+  {
+    \"Certification Name\": \"...\",
+    \"Field\": \"...\",
+    \"Date\": \"...\"
+  }
+]
+
+- Include recognized certifications (AWS, Azure, PMP, etc.)
+- Skip generic workshops or courses with no credential
+
+===========================
+7. \"Education\"
+===========================
+[
+  {
+    \"Degree\": \"...\",
+    \"Institution\": \"...\",
+    \"Duration\": \"...\"
+  }
+]
+
+DO:
+- Include all valid academic entries (e.g., B.Tech, M.Sc., 12th, 10th)
+- Only include if both Degree and Institution are present
+- Extract from bullet, inline, or table format
+- If duration missing, use \"Not Specified\" — do NOT skip entry
+
+DO NOT:
+- Include CGPA, GPA, marks, or grades
+- Include location/city/state
+
+===========================
+8. \"Languages\"
+===========================
+Two valid formats:
+1. Simple list:
+   [\"English\", \"Hindi\"]
+2. Structured:
+[
+  {
+    \"Name\": \"English\",
+    \"Level\": \"Fluent\"
+  },
+  {
+    \"Name\": \"Hindi\",
+    \"Level\": \"Basic\"
+  }
+]
+
+===========================
+9. \"Projects\"
+===========================
+[
+  {
+    \"Title\": \"...\",
+    \"Stack\": \"...\",
+    \"Description\": \"...\"
+  }
+]
+
+DO:
+- Extract from both dedicated \"Projects\" section AND Employment History bullets
+- Look for action verbs: developed, built, implemented, created
+- Stack = list of technologies used
+- Description = concise project summary
+
+DO NOT:
+- Use titles like \"Project 1\"
+- Use client or company names as project titles
+- Include duplicate or vague entries
+
+===========================
+STRICT FINAL JSON FORMAT
+===========================
+{
+  \"Recent Employer\": \"...\",
+  \"Job Title\": \"...\",
+  \"Professional Summary\": \"...\",
+  \"Employment History\": {
+    \"Company A\": [
+      {
+        \"Role\": \"...\",
+        \"Duration\": \"...\",
+        \"Description\": \"...\"
+      }
+    ]
+  },
+  \"Skills\": {
+    \"Hard Skill\": [\"...\"],
+    \"Soft Skill\": [\"...\"]
+  },
+  \"Certifications\": [
+    {
+      \"Certification Name\": \"...\",
+      \"Field\": \"...\",
+      \"Date\": \"...\"
+    }
+  ],
+  \"Education\": [
+    {
+      \"Degree\": \"...\",
+      \"Institution\": \"...\",
+      \"Duration\": \"...\"
+    }
+  ],
+  \"Languages\": [\"English\", \"Hindi\"],
+  \"Projects\": [
+    {
+      \"Title\": \"...\",
+      \"Stack\": \"...\",
+      \"Description\": \"...\"
+    }
+  ]
+}
+
+===========================
+Resume to Parse
+===========================
+<<<RESUME_START>>>
+{text}
+<<<RESUME_END>>>
+""".strip()
+
+--------------------------------------------------------------------------------------------
+llama3_prompting
+import subprocess
+import json
+import re
+import unicodedata
+from config import LLAMA_MODEL_NAME, PROMPT_TEMPLATE
+
+def sanitize_llama_output(raw_output):
+    # Remove preamble before the first {
+    raw_output = re.sub(r'^.*?{', '{', raw_output, flags=re.DOTALL)
+    raw_output = raw_output.replace("“", '"').replace("”", '"')
+    raw_output = re.sub(r'"([^"\n]+)\':', r'"\1":', raw_output)
+    raw_output = re.sub(r'\}\s*"([A-Za-z])', r'},\n"\1', raw_output)
+    raw_output = re.sub(r'\]\s*"([A-Za-z])', r'],\n"\1', raw_output)
+    raw_output = re.sub(r',\s*(\}|\])', r'\1', raw_output)
+
+    # Fix unbalanced braces
+    open_braces = raw_output.count("{")
+    close_braces = raw_output.count("}")
+    if close_braces < open_braces:
+        raw_output += "}" * (open_braces - close_braces)
+
+    return raw_output.strip()
+
+def is_valid_duration(text):
+    if not text or not isinstance(text, str):
+        return False
+    patterns = [
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-–]*\d{2,4}",
+        r"\d{4}\s*[-–to]+\s*(Present|\d{4})",
+        r"\d{2}/\d{4}",
+        r"Present|Current"
+    ]
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+def normalize(text):
+    return unicodedata.normalize("NFKD", text or "").strip().lower()
+
+def clean_employment_history(employment_data, project_titles=None):
+    cleaned = {}
+    seen_keys = set()
+
+    for company, roles in employment_data.items():
+        if not company or not isinstance(roles, list):
+            continue
+
+        company_name = company.strip()
+        company_norm = normalize(company_name)
+        if not re.search(r"[a-zA-Z]", company_name):
+            continue  # skip empty or invalid company names
+
+        valid_roles = []
+        for role in roles:
+            if not isinstance(role, dict):
+                continue
+
+            role_title = (role.get("Role") or "").strip()
+            duration = (role.get("Duration") or "").strip()
+            description = (role.get("Description") or "").strip()
+
+            if not role_title and not duration:
+                continue
+
+            if not is_valid_duration(duration):
+                duration = "Not Specified"
+            if not description:
+                description = "Not Specified"
+
+            if project_titles:
+                combined = normalize(role_title + " " + description)
+                if any(pt in combined for pt in project_titles):
+                    continue  # prevent project entries inside employment
+
+            key = (company_norm, normalize(role_title), normalize(duration), normalize(description))
+            if key in seen_keys:
+                continue
+
+            seen_keys.add(key)
+            valid_roles.append({
+                "Role": role_title or "Not Specified",
+                "Duration": duration,
+                "Description": description
+            })
+
+        if valid_roles:
+            cleaned[company_name] = valid_roles
+
+    return cleaned
+
+def clean_education(edu_list):
+    cleaned = []
+    for entry in edu_list:
+        if not isinstance(entry, dict):
+            continue
+        degree = (entry.get("Degree") or "").strip()
+        institution = (entry.get("Institution") or "").strip()
+        duration = (entry.get("Duration") or "").strip()
+        if degree and institution:
+            cleaned.append({
+                "Degree": degree,
+                "Institution": institution,
+                "Duration": duration if duration else "Not Specified"
+            })
+    return cleaned
+
+def extract_resume_info(text):
+    context_prefix = (
+        "<<BEGIN INSTRUCTIONS>>\n"
+        "You are a strict JSON-only resume parser.\n"
+        "- DO NOT include markdown, bullet points, commentary, or explanation.\n"
+        "- Only respond with a syntactically valid JSON object.\n"
+        "- Begin your response with '{' and end with '}'.\n"
+        "- Ensure projects and employment history are separate.\n"
+        "- Disambiguate clients vs actual employers.\n"
+        "- Extract distinct company roles, even from inline or tabular resumes.\n"
+        "<<END INSTRUCTIONS>>\n\n"
+        "<<BEGIN RESUME>>\n"
+        f"{text}\n"
+        "<<END RESUME>>\n\n"
+        "Now respond ONLY with the JSON data in the schema described above:"
+    )
+
+    full_prompt = f"{context_prefix}\n\n{PROMPT_TEMPLATE}"
+
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                ["ollama", "run", LLAMA_MODEL_NAME],
+                input=full_prompt,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            raw_output = result.stdout.strip()
+            print("---- RAW LLaMA OUTPUT ----")
+            print(raw_output[:1000])
+            print("---- END ----")
+
+            start_idx = raw_output.find("{")
+            end_idx = raw_output.rfind("}")
+            if start_idx == -1 or end_idx == -1:
+                print("❌ No JSON found in output.")
+                return {}
+
+            json_block = raw_output[start_idx:end_idx + 1]
+            cleaned_output = sanitize_llama_output(json_block)
+
+            with open("json/last_raw_output.txt", "w", encoding="utf-8") as debug_file:
+                debug_file.write(cleaned_output)
+
+            data = json.loads(cleaned_output)
+
+            # Projects: Filter only valid entries
+            if "Projects" not in data or not isinstance(data["Projects"], list):
+                data["Projects"] = []
+            data["Projects"] = [
+                p for p in data["Projects"]
+                if isinstance(p, dict) and p.get("Title") and p.get("Description")
+            ]
+
+            # Project titles used for filtering out employment duplicates
+            project_titles = {
+                (p.get("Title") or "").strip().lower()
+                for p in data["Projects"]
+                if isinstance(p, dict)
+            }
+
+            # Clean Employment
+            if "Employment History" in data:
+                data["Employment History"] = clean_employment_history(
+                    data["Employment History"], project_titles
+                )
+
+            if not data.get("Employment History"):
+                recent_employer = data.get("Recent Employer", "").strip()
+                job_title = data.get("Job Title", "").strip()
+                summary = data.get("Professional Summary", "").strip()
+                if recent_employer and job_title:
+                    fallback_entry = {
+                        "Role": job_title,
+                        "Duration": "Not Specified",
+                        "Description": summary[:250] or "Not Specified"
+                    }
+                    data["Employment History"] = {
+                        recent_employer: [fallback_entry]
+                    }
+
+            # Clean Education
+            if "Education" in data and isinstance(data["Education"], list):
+                data["Education"] = clean_education(data["Education"])
+
+            return data
+
+        except json.JSONDecodeError as e:
+            print(f"⚠️ JSON decode error: {e}")
+            if attempt == 0:
+                print("🔁 Retrying once more...")
+                continue
+            return {}
+        except Exception as e:
+            print(f"❌ Unexpected error: {e}")
+            return {}
+----------------------------------------------------------------------------------------------------
